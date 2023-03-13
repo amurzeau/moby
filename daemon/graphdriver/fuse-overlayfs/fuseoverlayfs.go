@@ -83,7 +83,10 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, graphdriver.ErrNotSupported
 	}
 	if !kernel.CheckKernelVersion(4, 18, 0) {
-		return nil, graphdriver.ErrNotSupported
+		if err := tryMount(); err != nil {
+			logger.Error(err)
+			return nil, graphdriver.ErrNotSupported
+		}
 	}
 
 	currentID := idtools.CurrentIdentity()
@@ -109,6 +112,59 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, idMap)
 
 	return d, nil
+}
+
+// Try to mount empty directories with fuse-overlayfs to check if it is supported.
+// This is done to detect cases where the kernel is older than 4.18 but support
+// fuse-overlayfs (such as RHEL/CentOS 7.8 kernels).
+func tryMount() error {
+	tempDir, err := os.MkdirTemp("", "fuse-overlayfs-try-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempDir)
+
+	lowerDir := path.Join(tempDir, "lowerdir")
+	upperDir := path.Join(tempDir, "upperdir")
+	workDir := path.Join(tempDir, "workdir")
+	mergedDir := path.Join(tempDir, "mergeddir")
+
+	if err = os.Mkdir(lowerDir, 0700); err != nil {
+		return err
+	}
+	if err = os.Mkdir(upperDir, 0700); err != nil {
+		return err
+	}
+	if err = os.Mkdir(workDir, 0700); err != nil {
+		return err
+	}
+	if err = os.Mkdir(mergedDir, 0700); err != nil {
+		return err
+	}
+
+	optionLine := "lowerdir=" + lowerDir + ",upperdir=" + upperDir + ",workdir=" + workDir
+
+	mountProgram := exec.Command(binary, "-o", optionLine, mergedDir)
+	mountProgram.Dir = tempDir
+	var b bytes.Buffer
+	mountProgram.Stderr = &b
+	if err = mountProgram.Run(); err != nil {
+		output := b.String()
+		if output == "" {
+			output = "<stderr empty>"
+		}
+		return errors.Wrapf(err, "can't use %s: %s", binary, output)
+	}
+
+	defer func() {
+		if unmounted := fusermountU(mergedDir); !unmounted {
+			if err := unix.Unmount(mergedDir, unix.MNT_DETACH); err != nil {
+				logger.Debugf("Failed to unmount %s - %v", mergedDir, err)
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (d *Driver) String() string {
